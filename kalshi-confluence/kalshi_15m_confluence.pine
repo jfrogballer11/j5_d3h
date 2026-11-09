@@ -1,0 +1,235 @@
+//@version=6
+// Kalshi 15m Confluence
+// Combines four checks into one YES / NO / NO TRADE answer for 15-minute crypto contracts:
+//   1. 15m trend   - McGinley baseline + channel (SSL Hybrid style), last CLOSED 15m bar
+//   2. 1m timing   - SSL (HMA of highs/lows) direction
+//   3. Forecast    - pattern matching (Next Pivot style): Pearson correlation on % change,
+//                    projected to the contract's expiry, % of best matches ending above strike
+//   4. Volume      - PVO (percentage volume oscillator) rising and above zero
+// Plus an entry-window filter (first N minutes of the contract).
+// Designed for a 1-minute chart.
+indicator("Kalshi 15m Confluence", shorttitle = "K15", overlay = true, max_bars_back = 5000,
+     max_labels_count = 200, max_polylines_count = 5)
+
+// ---------------- Inputs ----------------
+grpC = "Contract"
+strikeIn    = input.float(0.0, "Strike price (0 = price at start of window)", group = grpC)
+contractMin = input.int(15, "Contract length (minutes)", minval = 1, group = grpC)
+entryWindow = input.int(8, "Only signal in first N minutes", minval = 1, group = grpC)
+edgeMargin  = input.int(5, "Safety margin for max price (cents)", minval = 0, maxval = 30, group = grpC)
+
+grpB = "1) 15m trend (SSL Hybrid baseline)"
+htfTf  = input.timeframe("15", "Trend timeframe", group = grpB)
+blLen  = input.int(50, "McGinley length", minval = 2, group = grpB)
+chMult = input.float(0.2, "Channel multiplier", step = 0.05, group = grpB)
+
+grpS = "2) 1m SSL (entry timing)"
+sslLen = input.int(30, "SSL HMA length", minval = 2, group = grpS)
+
+grpF = "3) Pattern forecast (Next Pivot style)"
+corrLen    = input.int(30, "Correlation length", minval = 5, maxval = 100, group = grpF)
+searchBars = input.int(2000, "Bars back to search", minval = 200, maxval = 4500, group = grpF)
+topK       = input.int(15, "Best matches to use", minval = 1, maxval = 50, group = grpF)
+probThresh = input.int(60, "Min % of matches that must agree", minval = 50, maxval = 95, group = grpF)
+
+grpV = "4) Volume (PVO)"
+pvoFast = input.int(6, "PVO fast length", minval = 1, group = grpV)
+pvoSlow = input.int(13, "PVO slow length", minval = 2, group = grpV)
+pvoSig  = input.int(5, "PVO signal length", minval = 1, group = grpV)
+
+grpD = "Display"
+showTable = input.bool(true, "Show checklist table", group = grpD)
+showPath  = input.bool(true, "Show projected path", group = grpD)
+bullCol   = input.color(#00c3ff, "Bullish color", group = grpD)
+bearCol   = input.color(#ff0062, "Bearish color", group = grpD)
+
+// ---------------- 1) 15m trend ----------------
+f_mcg(src, len) =>
+    e = ta.ema(src, len)
+    var float mg = na
+    mg := na(mg) ? e : mg + (src - mg) / (len * math.pow(src / mg, 4))
+    mg
+
+f_htf(len, mult) =>
+    mg = f_mcg(close, len)
+    r  = ta.ema(ta.tr(true), len)
+    // [1] + lookahead_on = values of the last CLOSED higher-timeframe bar (no repainting)
+    [mg[1], mg[1] + r[1] * mult, mg[1] - r[1] * mult, close[1]]
+
+[hBase, hUp, hLo, hClose] = request.security(syminfo.tickerid, htfTf, f_htf(blLen, chMult), lookahead = barmerge.lookahead_on)
+
+bias = hClose > hUp ? 1 : hClose < hLo ? -1 : 0
+
+// ---------------- 2) 1m SSL ----------------
+sslHi = ta.hma(high, sslLen)
+sslLo = ta.hma(low, sslLen)
+var int hlv = 0
+hlv := close > sslHi ? 1 : close < sslLo ? -1 : hlv
+sslLine = hlv < 0 ? sslHi : sslLo
+
+// ---------------- 4) Volume (PVO) ----------------
+vF = ta.ema(nz(volume), pvoFast)
+vS = ta.ema(nz(volume), pvoSlow)
+pvo = vS > 0 ? (vF - vS) / vS * 100 : 0.0
+pvoSignal = ta.ema(pvo, pvoSig)
+hasVolume = vS > 0
+volOk = hasVolume and pvo > 0 and pvo > pvoSignal
+
+// ---------------- Contract timing ----------------
+msC = contractMin * 60000
+tStart = time - time % msC
+tEnd = tStart + msC
+minsElapsed = (time - tStart) / 60000.0
+var float startPx = na
+if tStart != tStart[1]
+    startPx := open
+strike = strikeIn > 0 ? strikeIn : startPx
+inWindow = minsElapsed < entryWindow
+barMs = timeframe.in_seconds() * 1000
+barsLeft = math.max(1, math.round((tEnd - time_close) / barMs))
+
+// ---------------- 3) Pattern forecast (last bar only) ----------------
+ret = close / close[1] - 1
+
+var float probAbove = na
+var float fcEnd = na
+var polyline pathLine = na
+var label pathLabel = na
+
+if barstate.islast and bar_index > searchBars + corrLen + 2
+    L = corrLen
+    fl = barsLeft
+    // current window: mean and centered values
+    float mx = 0.0
+    for j = 0 to L - 1
+        mx += nz(ret[j])
+    mx /= L
+    float sxx = 0.0
+    for j = 0 to L - 1
+        dx = nz(ret[j]) - mx
+        sxx += dx * dx
+
+    corrs = array.new_float()
+    idxs  = array.new_int()
+    sFrom = math.max(fl, L)   // no overlap with the current window
+    for s = sFrom to searchBars
+        float sy  = 0.0
+        float syy = 0.0
+        float sxy = 0.0
+        for j = 0 to L - 1
+            y = nz(ret[s + j])
+            sy  += y
+            syy += y * y
+            sxy += (nz(ret[j]) - mx) * y
+        varY = syy - sy * sy / L
+        if varY > 0 and sxx > 0
+            array.push(corrs, sxy / math.sqrt(sxx * varY))
+            array.push(idxs, s)
+
+    n = array.size(corrs)
+    if n > 0
+        ord = array.sort_indices(corrs, order.descending)
+        k = math.min(topK, n)
+        int above = 0
+        pathSum = array.new_float(fl, 0.0)
+        for m = 0 to k - 1
+            s = array.get(idxs, array.get(ord, m))
+            float p = close
+            // what happened in the fl bars after this match, applied to today's price
+            for t = 1 to fl
+                p *= 1 + nz(ret[s - t])
+                array.set(pathSum, t - 1, array.get(pathSum, t - 1) + p)
+            if p > strike
+                above += 1
+        probAbove := above * 100.0 / k
+        fcEnd := array.get(pathSum, fl - 1) / k
+
+        if not na(pathLine)
+            polyline.delete(pathLine)
+        if not na(pathLabel)
+            label.delete(pathLabel)
+        if showPath
+            pts = array.new<chart.point>()
+            array.push(pts, chart.point.from_index(bar_index, close))
+            for t = 1 to fl
+                array.push(pts, chart.point.from_index(bar_index + t, array.get(pathSum, t - 1) / k))
+            pathCol = probAbove >= 50 ? bullCol : bearCol
+            pathLine := polyline.new(pts, line_color = pathCol, line_width = 2, line_style = line.style_dashed)
+            pathLabel := label.new(bar_index + fl, fcEnd, str.tostring(probAbove, "#") + "% above",
+                 style = label.style_label_left, color = color.new(pathCol, 20), textcolor = color.white, size = size.small)
+
+// ---------------- Verdict ----------------
+fcYes = not na(probAbove) and probAbove >= probThresh
+fcNo  = not na(probAbove) and probAbove <= 100 - probThresh
+
+sslAgrees = bias != 0 and hlv == bias
+fcAgrees  = bias == 1 ? fcYes : bias == -1 ? fcNo : false
+
+yesAll = bias == 1  and hlv == 1  and volOk and inWindow and fcYes
+noAll  = bias == -1 and hlv == -1 and volOk and inWindow and fcNo
+
+// Historical markers use checks 1, 2, 4 and the window (the forecast only runs on the live bar)
+yesSetup = bias == 1  and hlv == 1  and volOk and inWindow
+noSetup  = bias == -1 and hlv == -1 and volOk and inWindow
+
+// ---------------- Plots ----------------
+baseCol = bias == 1 ? bullCol : bias == -1 ? bearCol : color.gray
+plot(hBase, "15m McGinley baseline", color = baseCol, linewidth = 2, style = plot.style_stepline)
+pUp = plot(hUp, "15m channel upper", color = color.new(color.gray, 60), style = plot.style_stepline)
+pLo = plot(hLo, "15m channel lower", color = color.new(color.gray, 60), style = plot.style_stepline)
+fill(pUp, pLo, color = color.new(color.gray, 85), title = "Chop zone")
+plot(sslLine, "1m SSL", color = hlv == 1 ? bullCol : bearCol, linewidth = 1)
+plot(strike, "Strike", color = color.yellow, linewidth = 1, style = plot.style_linebr)
+
+plotshape(yesSetup and not yesSetup[1], "YES setup", shape.triangleup, location.belowbar, bullCol, size = size.tiny)
+plotshape(noSetup and not noSetup[1], "NO setup", shape.triangledown, location.abovebar, bearCol, size = size.tiny)
+bgcolor(yesAll ? color.new(bullCol, 80) : noAll ? color.new(bearCol, 80) : na, title = "Live signal")
+
+// ---------------- Alerts ----------------
+if barstate.isrealtime and barstate.isconfirmed
+    if yesAll
+        alert("K15: BUY YES/ABOVE " + syminfo.ticker + " | strike " + str.tostring(strike, format.mintick) +
+             " | " + str.tostring(probAbove, "#") + "% of matches above", alert.freq_once_per_bar_close)
+    if noAll
+        alert("K15: BUY NO/BELOW " + syminfo.ticker + " | strike " + str.tostring(strike, format.mintick) +
+             " | " + str.tostring(100 - probAbove, "#") + "% of matches below", alert.freq_once_per_bar_close)
+
+// ---------------- Checklist table ----------------
+var table tb = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 15),
+     frame_color = color.gray, frame_width = 1, border_width = 1)
+
+f_row(r, a, b, col) =>
+    table.cell(tb, 0, r, a, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, b, text_color = col, text_size = size.small, text_halign = text.align_left)
+
+ck(ok) => ok ? " ✅" : " ❌"
+
+if showTable and barstate.islast
+    secsLeft = int(math.max(0, (tEnd - timenow) / 1000))
+    ss = secsLeft % 60
+    timeTxt = str.tostring(math.floor(secsLeft / 60)) + ":" + (ss < 10 ? "0" : "") + str.tostring(ss)
+
+    trendTxt = bias == 1 ? "UP" + ck(true) : bias == -1 ? "DOWN" + ck(true) : "CHOP - skip ❌"
+    sslTxt   = (hlv == 1 ? "UP" : "DOWN") + ck(sslAgrees)
+    fcTxt    = na(probAbove) ? "loading..." : str.tostring(probAbove, "#") + "% above" + ck(fcAgrees)
+    volTxt   = not hasVolume ? "no volume data ❌" : (volOk ? "rising" : "weak") + ck(volOk)
+    winTxt   = "min " + str.tostring(math.floor(minsElapsed) + 1) + " of " + str.tostring(contractMin) + ck(inWindow)
+
+    verdict = yesAll ? "BUY YES / ABOVE" : noAll ? "BUY NO / BELOW" : "NO TRADE"
+    vCol    = yesAll ? bullCol : noAll ? bearCol : color.gray
+    maxPx   = yesAll ? probAbove - edgeMargin : noAll ? (100 - probAbove) - edgeMargin : na
+    pxTxt   = na(maxPx) ? "-" : "pay at most " + str.tostring(math.max(0, maxPx), "#") + "¢"
+
+    f_row(0, "Time left", timeTxt, color.white)
+    f_row(1, "Strike", str.tostring(strike, format.mintick), color.yellow)
+    f_row(2, "1. 15m trend", trendTxt, color.white)
+    f_row(3, "2. 1m SSL", sslTxt, color.white)
+    f_row(4, "3. Forecast", fcTxt, color.white)
+    f_row(5, "4. Volume", volTxt, color.white)
+    f_row(6, "5. Entry window", winTxt, color.white)
+    f_row(7, "VERDICT", verdict, vCol)
+    f_row(8, "Kalshi price", pxTxt, vCol)
+    if timeframe.in_seconds() != 60
+        f_row(9, "⚠ Chart", "switch to 1 minute", color.orange)
+    else
+        f_row(9, "", "", color.white)
