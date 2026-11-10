@@ -42,6 +42,9 @@ showTable = input.bool(true, "Show checklist table", group = grpD)
 showPath  = input.bool(true, "Show projected path", group = grpD)
 bullCol   = input.color(#00c3ff, "Bullish color", group = grpD)
 bearCol   = input.color(#ff0062, "Bearish color", group = grpD)
+upArrCol  = input.color(#00e676, "Up arrow color", group = grpD)
+dnArrCol  = input.color(#ff1744, "Down arrow color", group = grpD)
+strikeCol = input.color(color.yellow, "Strike line color", group = grpD)
 
 // ---------------- 1) 15m trend ----------------
 f_mcg(src, len) =>
@@ -173,16 +176,27 @@ yesSetup = bias == 1  and hlv == 1  and volOk and inWindow
 noSetup  = bias == -1 and hlv == -1 and volOk and inWindow
 
 // ---------------- Plots ----------------
+// 15m baseline drawn smooth: one point per 15m candle, joined by straight lines
+// (no stair steps). Values are exactly the ones the trend check uses.
+newHtf = ta.change(hBase) != 0 or barstate.islast
 baseCol = bias == 1 ? bullCol : bias == -1 ? bearCol : color.gray
-plot(hBase, "15m McGinley baseline", color = baseCol, linewidth = 2, style = plot.style_stepline)
-pUp = plot(hUp, "15m channel upper", color = color.new(color.gray, 60), style = plot.style_stepline)
-pLo = plot(hLo, "15m channel lower", color = color.new(color.gray, 60), style = plot.style_stepline)
-fill(pUp, pLo, color = color.new(color.gray, 85), title = "Chop zone")
+plot(newHtf ? hBase : na, "15m McGinley baseline", color = color.new(baseCol, 15), linewidth = 3, style = plot.style_line)
+plot(newHtf ? hUp : na, "15m channel upper", color = color.new(color.gray, 50), linewidth = 1, style = plot.style_line)
+plot(newHtf ? hLo : na, "15m channel lower", color = color.new(color.gray, 50), linewidth = 1, style = plot.style_line)
 plot(sslLine, "1m SSL", color = hlv == 1 ? bullCol : bearCol, linewidth = 1)
-plot(strike, "Strike", color = color.yellow, linewidth = 1, style = plot.style_linebr)
 
-plotshape(yesSetup and not yesSetup[1], "YES setup", shape.triangleup, location.belowbar, bullCol, size = size.tiny)
-plotshape(noSetup and not noSetup[1], "NO setup", shape.triangledown, location.abovebar, bearCol, size = size.tiny)
+// Strike: one straight horizontal line across the whole chart
+var line strikeLine = na
+if barstate.islast and not na(strike)
+    if na(strikeLine)
+        strikeLine := line.new(bar_index - 1, strike, bar_index, strike, extend = extend.both, color = strikeCol, width = 2)
+    else
+        line.set_xy1(strikeLine, bar_index - 1, strike)
+        line.set_xy2(strikeLine, bar_index, strike)
+plot(strike, "Strike price tag", color = strikeCol, display = display.price_scale)
+
+plotshape(yesSetup and not yesSetup[1], "Up arrow", shape.arrowup, location.belowbar, upArrCol, size = size.small)
+plotshape(noSetup and not noSetup[1], "Down arrow", shape.arrowdown, location.abovebar, dnArrCol, size = size.small)
 bgcolor(yesAll ? color.new(bullCol, 80) : noAll ? color.new(bearCol, 80) : na, title = "Live signal")
 
 // ---------------- Alerts ----------------
