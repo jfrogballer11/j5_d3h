@@ -13,7 +13,9 @@ indicator("Kalshi 15m Confluence", shorttitle = "K15", overlay = true, max_bars_
 
 // ---------------- Inputs ----------------
 grpC = "Contract"
-strikeIn    = input.float(0.0, "Strike price (0 = price at start of window)", group = grpC)
+strikeIn    = input.float(0.0, "Strike price (0 = automatic)", group = grpC)
+strikeMode  = input.string("Multi-exchange average", "Automatic strike source", options = ["Multi-exchange average", "Chart open"], group = grpC)
+strikeAdj   = input.float(0.0, "Strike nudge (+/-)", step = 0.1, group = grpC)
 contractMin = input.int(15, "Contract length (minutes)", minval = 1, group = grpC)
 entryWindow = input.int(8, "Only signal in first N minutes", minval = 1, group = grpC)
 edgeMargin  = input.int(5, "Safety margin for max price (cents)", minval = 0, maxval = 30, group = grpC)
@@ -84,10 +86,33 @@ msC = contractMin * 60000
 tStart = time - time % msC
 tEnd = tStart + msC
 minsElapsed = (time - tStart) / 60000.0
+// Kalshi settles on an index averaged across several exchanges, not one chart feed.
+// Approximate it: average of the last minute's typical price on 4 major USD exchanges.
+f_px(ex) => request.security(ex + ":" + syminfo.basecurrency + "USD", timeframe.period, hlc3, ignore_invalid_symbol = true)
+pxA = f_px("COINBASE")
+pxB = f_px("KRAKEN")
+pxC = f_px("BITSTAMP")
+pxD = f_px("GEMINI")
+float compSum = 0.0
+int compN = 0
+if not na(pxA)
+    compSum += pxA
+    compN += 1
+if not na(pxB)
+    compSum += pxB
+    compN += 1
+if not na(pxC)
+    compSum += pxC
+    compN += 1
+if not na(pxD)
+    compSum += pxD
+    compN += 1
+composite = compN > 0 ? compSum / compN : hlc3
+
 var float startPx = na
 if tStart != tStart[1]
-    startPx := open
-strike = strikeIn > 0 ? strikeIn : startPx
+    startPx := strikeMode == "Chart open" ? open : nz(composite[1], open)
+strike = strikeIn > 0 ? strikeIn : startPx + strikeAdj
 inWindow = minsElapsed < entryWindow
 barMs = timeframe.in_seconds() * 1000
 barsLeft = math.max(1, math.round((tEnd - time_close) / barMs))
