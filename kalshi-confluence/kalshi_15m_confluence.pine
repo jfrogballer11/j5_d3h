@@ -45,6 +45,7 @@ bearCol   = input.color(#ff0062, "Bearish color", group = grpD)
 upArrCol  = input.color(#00e676, "Up arrow color", group = grpD)
 dnArrCol  = input.color(#ff1744, "Down arrow color", group = grpD)
 strikeCol = input.color(color.yellow, "Strike line color", group = grpD)
+strikeW   = input.int(4, "Strike line thickness", minval = 1, maxval = 10, group = grpD)
 
 // ---------------- 1) 15m trend ----------------
 f_mcg(src, len) =>
@@ -189,7 +190,7 @@ plot(sslLine, "1m SSL", color = hlv == 1 ? bullCol : bearCol, linewidth = 1)
 var line strikeLine = na
 if barstate.islast and not na(strike)
     if na(strikeLine)
-        strikeLine := line.new(bar_index - 1, strike, bar_index, strike, extend = extend.both, color = strikeCol, width = 2)
+        strikeLine := line.new(bar_index - 1, strike, bar_index, strike, extend = extend.both, color = strikeCol, width = strikeW)
     else
         line.set_xy1(strikeLine, bar_index - 1, strike)
         line.set_xy2(strikeLine, bar_index, strike)
