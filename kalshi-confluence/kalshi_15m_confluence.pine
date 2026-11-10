@@ -87,8 +87,8 @@ tStart = time - time % msC
 tEnd = tStart + msC
 minsElapsed = (time - tStart) / 60000.0
 // Kalshi settles on an index averaged across several exchanges, not one chart feed.
-// Approximate it: average of the last minute's typical price on 4 major USD exchanges.
-f_px(ex) => request.security(ex + ":" + syminfo.basecurrency + "USD", timeframe.period, hlc3, ignore_invalid_symbol = true)
+// Approximate it: average closing price of the last minute on 4 major USD exchanges.
+f_px(ex) => request.security(ex + ":" + syminfo.basecurrency + "USD", timeframe.period, close, ignore_invalid_symbol = true)
 pxA = f_px("COINBASE")
 pxB = f_px("KRAKEN")
 pxC = f_px("BITSTAMP")
