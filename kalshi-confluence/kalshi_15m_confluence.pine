@@ -19,6 +19,7 @@ strikeAdj   = input.float(0.0, "Strike nudge (+/-)", step = 0.1, group = grpC)
 contractMin = input.int(15, "Contract length (minutes)", minval = 1, group = grpC)
 entryWindow = input.int(8, "Only signal in first N minutes", minval = 1, group = grpC)
 edgeMargin  = input.int(5, "Safety margin for max price (cents)", minval = 0, maxval = 30, group = grpC)
+volLen      = input.int(60, "Volatility lookback for fair value (bars)", minval = 10, group = grpC, tooltip = "Fair value = chance the price finishes at or above the strike, from recent 1m volatility and time left (normal model).")
 
 grpB = "1) 15m trend (SSL Hybrid baseline)"
 htfTf  = input.timeframe("15", "Trend timeframe", group = grpB)
@@ -38,6 +39,13 @@ grpV = "4) Volume (PVO)"
 pvoFast = input.int(6, "PVO fast length", minval = 1, group = grpV)
 pvoSlow = input.int(13, "PVO slow length", minval = 2, group = grpV)
 pvoSig  = input.int(5, "PVO signal length", minval = 1, group = grpV)
+
+grpR = "6) ROC reset (Jordi Visser idea, optional)"
+useRoc  = input.bool(false, "Require ROC reset", group = grpR, tooltip = "Only signal after price ran hot in the trend direction and has since cooled off (rate of change back near zero) while the trend is intact. The scorecard grades this rule even when it is off.")
+rocLen  = input.int(10, "ROC length (bars)", minval = 2, group = grpR)
+rocHot  = input.float(0.15, "'Ran hot' ROC (%)", step = 0.01, minval = 0.01, group = grpR)
+rocCalm = input.float(0.05, "'Reset' band: |ROC| below (%)", step = 0.01, minval = 0.0, group = grpR)
+rocLook = input.int(30, "Look back for the hot run (bars)", minval = 2, group = grpR)
 
 grpD = "Display"
 showTable = input.bool(true, "Show checklist table", group = grpD)
@@ -81,6 +89,12 @@ pvoSignal = ta.ema(pvo, pvoSig)
 hasVolume = vS > 0
 volOk = hasVolume and pvo > 0 and pvo > pvoSignal
 
+// ---------------- 6) ROC reset ----------------
+roc = ta.roc(close, rocLen)
+rocCalmNow = math.abs(roc) < rocCalm
+rocUp = rocCalmNow and ta.highest(roc, rocLook) > rocHot
+rocDn = rocCalmNow and ta.lowest(roc, rocLook) < -rocHot
+
 // ---------------- Contract timing ----------------
 msC = contractMin * 60000
 tStart = time - time % msC
@@ -116,6 +130,24 @@ strike = strikeIn > 0 ? strikeIn : startPx + strikeAdj
 inWindow = minsElapsed < entryWindow
 barMs = timeframe.in_seconds() * 1000
 barsLeft = math.max(1, math.round((tEnd - time_close) / barMs))
+
+// ---------------- Fair value (volatility model) ----------------
+// P(YES) = N( ln(price / strike) / (1m volatility * sqrt(minutes left)) )
+f_ncdf(x) =>
+    t = 1.0 / (1.0 + 0.2316419 * math.abs(x))
+    d = 0.3989423 * math.exp(-x * x / 2.0)
+    p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))))
+    x > 0 ? 1.0 - p : p
+
+// Kalshi taker fee per contract in cents: ceil(0.07 * P * (1 - P) * 100), P in dollars
+f_fee(cents) =>
+    pp = cents / 100.0
+    math.ceil(0.07 * pp * (1.0 - pp) * 100.0)
+
+sig1m = ta.stdev(math.log(close / close[1]), volLen)
+sigLeft = sig1m * math.sqrt(barsLeft)
+fairYes = na(strike) or na(sigLeft) ? na : sigLeft <= 0 ? (close >= strike ? 99.0 : 1.0) : math.max(1.0, math.min(99.0, 100.0 * f_ncdf(math.log(close / strike) / sigLeft)))
+fairNo = na(fairYes) ? na : 100.0 - fairYes
 
 // ---------------- 3) Pattern forecast (last bar only) ----------------
 ret = close / close[1] - 1
@@ -194,12 +226,59 @@ fcNo  = not na(probAbove) and probAbove <= 100 - probThresh
 sslAgrees = bias != 0 and hlv == bias
 fcAgrees  = bias == 1 ? fcYes : bias == -1 ? fcNo : false
 
-yesAll = bias == 1  and hlv == 1  and volOk and inWindow and fcYes
-noAll  = bias == -1 and hlv == -1 and volOk and inWindow and fcNo
+// Checks 1, 2, 4 and the window (the forecast only runs on the live bar, so history can't use it)
+yesBase = bias == 1  and hlv == 1  and volOk and inWindow
+noBase  = bias == -1 and hlv == -1 and volOk and inWindow
+rocYesOk = not useRoc or rocUp
+rocNoOk  = not useRoc or rocDn
 
-// Historical markers use checks 1, 2, 4 and the window (the forecast only runs on the live bar)
-yesSetup = bias == 1  and hlv == 1  and volOk and inWindow
-noSetup  = bias == -1 and hlv == -1 and volOk and inWindow
+yesSetup = yesBase and rocYesOk
+noSetup  = noBase and rocNoOk
+yesAll = yesSetup and fcYes
+noAll  = noSetup and fcNo
+
+// ---------------- Scorecard ----------------
+// Grades past signals on this chart: the first signal in each 15m contract is "bought",
+// then checked against the settle price when the contract ends.
+// Kalshi resolves ties as YES ("at least" the target): YES wins if settle >= strike, NO if settle < strike.
+type Score
+    int   dir    = 0
+    float k      = na
+    int   wins   = 0
+    int   losses = 0
+
+f_score(Score s, bool newWin, float settle, bool up, bool dn, float k) =>
+    if newWin
+        if s.dir != 0 and not na(settle) and not na(s.k)
+            won = s.dir == 1 ? settle >= s.k : settle < s.k
+            if won
+                s.wins := s.wins + 1
+            else
+                s.losses := s.losses + 1
+        s.dir := 0
+    if s.dir == 0 and (up or dn) and not na(k)
+        s.dir := up ? 1 : -1
+        s.k := k
+    s.dir
+
+newWin = tStart != tStart[1]
+settlePx = strikeMode == "Chart open" ? close[1] : nz(composite[1], close[1])
+scoreStrike = startPx + strikeAdj   // history always uses the automatic strike
+
+var Score scRules = Score.new()
+var Score scRoc   = Score.new()
+var Score scTrend = Score.new()
+f_score(scRules, newWin, settlePx, yesBase, noBase, scoreStrike)
+f_score(scRoc,   newWin, settlePx, yesBase and rocUp, noBase and rocDn, scoreStrike)
+f_score(scTrend, newWin, settlePx, bias == 1 and inWindow, bias == -1 and inWindow, scoreStrike)
+
+f_scoreTxt(Score s) =>
+    n = s.wins + s.losses
+    n == 0 ? "no signals yet" : str.tostring(s.wins * 100.0 / n, "#") + "% won of " + str.tostring(n) + (n < 50 ? " (small sample)" : "")
+
+f_scoreCol(Score s) =>
+    n = s.wins + s.losses
+    n < 50 ? color.gray : s.wins * 100.0 / n >= 60 ? color.lime : s.wins * 100.0 / n >= 52 ? color.orange : color.red
 
 // ---------------- Plots ----------------
 // 15m baseline drawn smooth: one point per 15m candle, joined by straight lines
@@ -235,7 +314,7 @@ if barstate.isrealtime and barstate.isconfirmed
              " | " + str.tostring(100 - probAbove, "#") + "% of matches below", alert.freq_once_per_bar_close)
 
 // ---------------- Checklist table ----------------
-var table tb = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 15),
+var table tb = table.new(position.top_right, 2, 16, bgcolor = color.new(color.black, 15),
      frame_color = color.gray, frame_width = 1, border_width = 1)
 
 f_row(r, a, b, col) =>
@@ -257,19 +336,31 @@ if showTable and barstate.islast
 
     verdict = yesAll ? "BUY YES / ABOVE" : noAll ? "BUY NO / BELOW" : "NO TRADE"
     vCol    = yesAll ? bullCol : noAll ? bearCol : color.gray
-    maxPx   = yesAll ? probAbove - edgeMargin : noAll ? (100 - probAbove) - edgeMargin : na
-    pxTxt   = na(maxPx) ? "-" : "pay at most " + str.tostring(math.max(0, maxPx), "#") + "¢"
+    // Max price = fair value of your side, minus Kalshi's fee, minus your safety margin
+    sideFair = yesAll ? fairYes : noAll ? fairNo : na
+    maxPx   = na(sideFair) ? na : sideFair - f_fee(sideFair) - edgeMargin
+    pxTxt   = na(maxPx) ? "-" : maxPx < 1 ? "no edge after fees - skip" : "pay at most " + str.tostring(math.floor(maxPx), "#") + "¢"
+    fairTxt = na(fairYes) ? "-" : "YES " + str.tostring(fairYes, "#") + "¢ / NO " + str.tostring(fairNo, "#") + "¢"
 
     f_row(0, "Time left", timeTxt, color.white)
     f_row(1, "Strike", str.tostring(strike, format.mintick), color.yellow)
     f_row(2, "1. 15m trend", trendTxt, color.white)
     f_row(3, "2. 1m SSL", sslTxt, color.white)
     f_row(4, "3. Forecast", fcTxt, color.white)
+    rocDir  = bias == 1 ? rocUp : bias == -1 ? rocDn : false
+    rocTxt  = not useRoc ? "off" + (rocDir ? " (would pass)" : " (would fail)") : (rocDir ? "reset" : "no reset") + ck(rocDir)
+
     f_row(5, "4. Volume", volTxt, color.white)
     f_row(6, "5. Entry window", winTxt, color.white)
-    f_row(7, "VERDICT", verdict, vCol)
-    f_row(8, "Kalshi price", pxTxt, vCol)
+    f_row(7, "6. ROC reset", rocTxt, useRoc ? color.white : color.gray)
+    f_row(8, "VERDICT", verdict, vCol)
+    f_row(9, "Kalshi price", pxTxt, vCol)
+    f_row(10, "Fair value", fairTxt, color.white)
     if timeframe.in_seconds() != 60
-        f_row(9, "⚠ Chart", "switch to 1 minute", color.orange)
+        f_row(11, "⚠ Chart", "switch to 1 minute", color.orange)
     else
-        f_row(9, "", "", color.white)
+        f_row(11, "", "", color.white)
+    f_row(12, "SCORECARD", "past signals on this chart", color.silver)
+    f_row(13, "Checks 1,2,4,5", f_scoreTxt(scRules), f_scoreCol(scRules))
+    f_row(14, "+ ROC reset", f_scoreTxt(scRoc), f_scoreCol(scRoc))
+    f_row(15, "Trend only", f_scoreTxt(scTrend), f_scoreCol(scTrend))
