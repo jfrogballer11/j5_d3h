@@ -128,5 +128,5 @@ case "${1:-}" in
   stop)    stop ;;
   status)  status ;;
   clients) clients ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
